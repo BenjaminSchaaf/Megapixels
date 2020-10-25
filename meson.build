@@ -35,3 +35,5 @@ install_data([
 install_data(['postprocess.sh'],
   install_dir : get_option('datadir') / 'megapixels/',
   install_mode: 'rwxr-xr-x')
+
+executable('quickdebayer_bench', 'quickdebayer.c', 'tools/quickdebayer_bench.c')
