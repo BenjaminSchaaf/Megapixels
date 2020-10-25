@@ -9,6 +9,7 @@
 #include <time.h>
 #include <assert.h>
 #include <limits.h>
+#include <math.h>
 #include <linux/kdev_t.h>
 #include <sys/sysmacros.h>
 #include <asm/errno.h>
@@ -19,6 +20,9 @@
 #include "config.h"
 #include "ini.h"
 #include "quickdebayer.h"
+#include "camera.h"
+#include "device.h"
+#include "pipeline.h"
 
 enum user_control {
 	USER_CONTROL_ISO,
@@ -34,15 +38,12 @@ struct buffer {
 
 struct camerainfo {
 	char dev_name[260];
-	unsigned int entity_id;
+	uint32_t pad_id;
 	char dev[260];
-	int width;
-	int height;
-	int rate;
-	int rotate;
-	int fmt;
-	int mbus;
+	MPCamera *camera;
+	MPCameraMode camera_mode;
 	int fd;
+	int rotate;
 
 	float colormatrix[9];
 	float forwardmatrix[9];
@@ -68,26 +69,19 @@ static float colormatrix_srgb[] = {
 	0.0556, -0.2039, 1.0569
 };
 
-struct buffer *buffers;
-static unsigned int n_buffers;
-
 struct camerainfo rear_cam;
 struct camerainfo front_cam;
-struct camerainfo current;
+struct camerainfo *current_cam;
 
 // Camera interface
 static char *media_drv_name;
-static unsigned int interface_entity_id;
+static uint32_t interface_pad_id;
 static char dev_name[260];
-static int media_fd;
 static int video_fd;
 static char *exif_make;
 static char *exif_model;
 
 // State
-static int ready = 0;
-static int capture = 0;
-static int current_is_rear = 1;
 static cairo_surface_t *surface = NULL;
 static cairo_surface_t *status_surface = NULL;
 static int preview_width = -1;
@@ -123,13 +117,6 @@ xioctl(int fd, int request, void *arg)
 }
 
 static void
-errno_exit(const char *s)
-{
-	fprintf(stderr, "%s error %d, %s\n", s, errno, strerror(errno));
-	exit(EXIT_FAILURE);
-}
-
-static void
 show_error(const char *s)
 {
 	gtk_label_set_text(GTK_LABEL(error_message), s);
@@ -151,104 +138,6 @@ remap(int value, int input_min, int input_max, int output_min, int output_max)
 
 	long long result = output_min + zero_output;
 	return (int)result;
-}
-
-static void
-start_capturing(int fd)
-{
-	enum v4l2_buf_type type;
-
-	for (int i = 0; i < n_buffers; ++i) {
-		struct v4l2_buffer buf = {
-			.type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
-			.memory = V4L2_MEMORY_MMAP,
-			.index = i,
-		};
-
-		if (xioctl(fd, VIDIOC_QBUF, &buf) == -1) {
-			errno_exit("VIDIOC_QBUF");
-		}
-	}
-
-	type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	if (xioctl(fd, VIDIOC_STREAMON, &type) == -1) {
-		errno_exit("VIDIOC_STREAMON");
-	}
-
-	ready = 1;
-}
-
-static void
-stop_capturing(int fd)
-{
-	int i;
-	ready = 0;
-	printf("Stopping capture\n");
-
-	enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	if (xioctl(fd, VIDIOC_STREAMOFF, &type) == -1) {
-		errno_exit("VIDIOC_STREAMOFF");
-	}
-
-	for (i = 0; i < n_buffers; ++i) {
-		munmap(buffers[i].start, buffers[i].length);
-	}
-
-}
-
-static void
-init_mmap(int fd)
-{
-	struct v4l2_requestbuffers req = {0};
-	req.count = 4;
-	req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	req.memory = V4L2_MEMORY_MMAP;
-
-	if (xioctl(fd, VIDIOC_REQBUFS, &req) == -1) {
-		if (errno == EINVAL) {
-			fprintf(stderr, "%s does not support memory mapping",
-				dev_name);
-			exit(EXIT_FAILURE);
-		} else {
-			errno_exit("VIDIOC_REQBUFS");
-		}
-	}
-
-	if (req.count < 2) {
-		fprintf(stderr, "Insufficient buffer memory on %s\n",
-			dev_name);
-		exit(EXIT_FAILURE);
-	}
-
-	buffers = calloc(req.count, sizeof(buffers[0]));
-
-	if (!buffers) {
-		fprintf(stderr, "Out of memory\\n");
-		exit(EXIT_FAILURE);
-	}
-
-	for (n_buffers = 0; n_buffers < req.count; ++n_buffers) {
-		struct v4l2_buffer buf = {
-			.type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
-			.memory = V4L2_MEMORY_MMAP,
-			.index = n_buffers,
-		};
-
-		if (xioctl(fd, VIDIOC_QUERYBUF, &buf) == -1) {
-			errno_exit("VIDIOC_QUERYBUF");
-		}
-
-		buffers[n_buffers].length = buf.length;
-		buffers[n_buffers].start = mmap(NULL /* start anywhere */,
-			buf.length,
-			PROT_READ | PROT_WRITE /* required */,
-			MAP_SHARED /* recommended */,
-			fd, buf.m.offset);
-
-		if (MAP_FAILED == buffers[n_buffers].start) {
-			errno_exit("mmap");
-		}
-	}
 }
 
 static int
@@ -329,14 +218,14 @@ draw_controls()
 	if (auto_exposure) {
 		sprintf(shutterangle, "auto");
 	} else {
-		temp = (int)((float)exposure / (float)current.height * 360);
+		temp = (int)((float)exposure / (float)current_cam->camera_mode.height * 360);
 		sprintf(shutterangle, "%d\u00b0", temp);
 	}
 
 	if (auto_gain) {
 		sprintf(iso, "auto");
 	} else {
-		temp = remap(gain - 1, 0, current.gain_max, current.iso_min, current.iso_max);
+		temp = remap(gain - 1, 0, current_cam->gain_max, current_cam->iso_min, current_cam->iso_max);
 		sprintf(iso, "%d", temp);
 	}
 
@@ -400,173 +289,6 @@ draw_controls()
 }
 
 static void
-init_sensor(char *fn, int width, int height, int mbus, int rate)
-{
-	int fd;
-	struct v4l2_subdev_frame_interval interval = {};
-	struct v4l2_subdev_format fmt = {};
-	fd = open(fn, O_RDWR);
-
-	g_print("Setting sensor rate to %d\n", rate);
-	interval.pad = 0;
-	interval.interval.numerator = 1;
-	interval.interval.denominator = rate;
-
-	if (xioctl(fd, VIDIOC_SUBDEV_S_FRAME_INTERVAL, &interval) == -1) {
-		errno_exit("VIDIOC_SUBDEV_S_FRAME_INTERVAL");
-	}
-
-	if (interval.interval.numerator != 1 || interval.interval.denominator != rate)
-		g_printerr("Driver chose %d/%d instead\n",
-			interval.interval.numerator, interval.interval.denominator);
-
-	g_print("Setting sensor to %dx%d fmt %d\n",
-		width, height, mbus);
-	fmt.pad = 0;
-	fmt.which = V4L2_SUBDEV_FORMAT_ACTIVE;
-	fmt.format.code = mbus;
-	fmt.format.width = width;
-	fmt.format.height = height;
-	fmt.format.field = V4L2_FIELD_ANY;
-
-	if (xioctl(fd, VIDIOC_SUBDEV_S_FMT, &fmt) == -1) {
-		errno_exit("VIDIOC_SUBDEV_S_FMT");
-	}
-	if (fmt.format.width != width || fmt.format.height != height || fmt.format.code != mbus)
-		g_printerr("Driver chose %dx%d fmt %d instead\n",
-			fmt.format.width, fmt.format.height,
-			fmt.format.code);
-
-	// Trigger continuous auto focus if the sensor supports it
-	if (v4l2_has_control(fd, V4L2_CID_FOCUS_AUTO)) {
-		current.has_af_c = 1;
-		v4l2_ctrl_set(fd, V4L2_CID_FOCUS_AUTO, 1);
-	}
-	if (v4l2_has_control(fd, V4L2_CID_AUTO_FOCUS_START)) {
-		current.has_af_s = 1;
-	}
-
-	if (v4l2_has_control(fd, V4L2_CID_GAIN)) {
-		current.gain_ctrl = V4L2_CID_GAIN;
-		current.gain_max = v4l2_ctrl_get_max(fd, V4L2_CID_GAIN);
-	}
-
-	if (v4l2_has_control(fd, V4L2_CID_ANALOGUE_GAIN)) {
-		current.gain_ctrl = V4L2_CID_ANALOGUE_GAIN;
-		current.gain_max = v4l2_ctrl_get_max(fd, V4L2_CID_ANALOGUE_GAIN);
-	}
-
-	auto_exposure = 1;
-	auto_gain = 1;
-	draw_controls();
-
-	close(current.fd);
-	current.fd = fd;
-}
-
-static int
-init_device(int fd)
-{
-	struct v4l2_capability cap;
-	if (xioctl(fd, VIDIOC_QUERYCAP, &cap) == -1) {
-		if (errno == EINVAL) {
-			fprintf(stderr, "%s is no V4L2 device\n",
-				dev_name);
-			exit(EXIT_FAILURE);
-		} else {
-			errno_exit("VIDIOC_QUERYCAP");
-		}
-	}
-
-	if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE)) {
-		fprintf(stderr, "%s is no video capture device\n",
-			dev_name);
-		exit(EXIT_FAILURE);
-	}
-
-	if (!(cap.capabilities & V4L2_CAP_STREAMING)) {
-		fprintf(stderr, "%s does not support streaming i/o\n",
-			dev_name);
-		exit(EXIT_FAILURE);
-	}
-
-	/* Select video input, video standard and tune here. */
-	struct v4l2_cropcap cropcap = {
-		.type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
-	};
-
-	struct v4l2_crop crop = {0};
-	if (xioctl(fd, VIDIOC_CROPCAP, &cropcap) == 0) {
-		crop.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-		crop.c = cropcap.defrect; /* reset to default */
-
-		if (xioctl(fd, VIDIOC_S_CROP, &crop) == -1) {
-			switch (errno) {
-				case EINVAL:
-					/* Cropping not supported. */
-					break;
-				default:
-					/* Errors ignored. */
-					break;
-			}
-		}
-	} else {
-		/* Errors ignored. */
-	}
-
-
-	struct v4l2_format fmt = {
-		.type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
-	};
-	if (current.width > 0) {
-		g_print("Setting camera to %dx%d fmt %d\n",
-			current.width, current.height, current.fmt);
-		fmt.fmt.pix.width = current.width;
-		fmt.fmt.pix.height = current.height;
-		fmt.fmt.pix.pixelformat = current.fmt;
-		fmt.fmt.pix.field = V4L2_FIELD_ANY;
-
-		if (xioctl(fd, VIDIOC_S_FMT, &fmt) == -1) {
-			g_printerr("VIDIOC_S_FMT failed");
-			show_error("Could not set camera mode");
-			return -1;
-		}
-		if (fmt.fmt.pix.width != current.width ||
-			fmt.fmt.pix.height != current.height ||
-			fmt.fmt.pix.pixelformat != current.fmt)
-			g_printerr("Driver returned %dx%d fmt %d\n",
-				fmt.fmt.pix.width, fmt.fmt.pix.height,
-				fmt.fmt.pix.pixelformat);
-
-
-		/* Note VIDIOC_S_FMT may change width and height. */
-	} else {
-		if (xioctl(fd, VIDIOC_G_FMT, &fmt) == -1) {
-			errno_exit("VIDIOC_G_FMT");
-		}
-		g_print("Got %dx%d fmt %d from the driver\n",
-			fmt.fmt.pix.width, fmt.fmt.pix.height,
-			fmt.fmt.pix.pixelformat);
-		current.width = fmt.fmt.pix.width;
-		current.height = fmt.fmt.pix.height;
-	}
-	current.fmt = fmt.fmt.pix.pixelformat;
-
-	/* Buggy driver paranoia. */
-	unsigned int min = fmt.fmt.pix.width * 2;
-	if (fmt.fmt.pix.bytesperline < min) {
-		fmt.fmt.pix.bytesperline = min;
-	}
-	min = fmt.fmt.pix.bytesperline * fmt.fmt.pix.height;
-	if (fmt.fmt.pix.sizeimage < min) {
-		fmt.fmt.pix.sizeimage = min;
-	}
-
-	init_mmap(fd);
-	return 0;
-}
-
-static void
 register_custom_tiff_tags(TIFF *tif)
 {
 	static const TIFFFieldInfo custom_fields[] = {
@@ -575,233 +297,6 @@ register_custom_tiff_tags(TIFF *tif)
 	
 	// Add missing dng fields
 	TIFFMergeFieldInfo(tif, custom_fields, sizeof(custom_fields) / sizeof(custom_fields[0]));
-}
-
-static void
-process_image(const int *p, int size)
-{
-	time_t rawtime;
-	char datetime[20] = {0};
-	struct tm tim;
-	uint8_t *pixels;
-	char fname[255];
-	char fname_target[255];
-	char command[1024];
-	char timestamp[30];
-	char uniquecameramodel[255];
-	GdkPixbuf *pixbuf;
-	GdkPixbuf *pixbufrot;
-	GdkPixbuf *thumb;
-	GError *error = NULL;
-	double scale;
-	cairo_t *cr;
-	TIFF *tif;
-	int skip = 2;
-	long sub_offset = 0;
-	uint64 exif_offset = 0;
-	static const short cfapatterndim[] = {2, 2};
-	static const float neutral[] = {1.0, 1.0, 1.0};
-	static uint16_t isospeed[] = {0};
-
-	// Only process preview frames when not capturing
-	if (capture == 0) {
-		if(current.width > 1280) {
-			skip = 3;
-		}
-		pixbuf = gdk_pixbuf_new(GDK_COLORSPACE_RGB, FALSE, 8, current.width / (skip*2), current.height / (skip*2));
-		pixels = gdk_pixbuf_get_pixels(pixbuf);
-		quick_debayer_bggr8((const uint8_t *)p, pixels, current.width, current.height, skip, current.blacklevel);
-
-		if (current.rotate == 0) {
-			pixbufrot = pixbuf;
-		} else if (current.rotate == 90) {
-			pixbufrot = gdk_pixbuf_rotate_simple(pixbuf, GDK_PIXBUF_ROTATE_COUNTERCLOCKWISE);
-		} else if (current.rotate == 180) {
-			pixbufrot = gdk_pixbuf_rotate_simple(pixbuf, GDK_PIXBUF_ROTATE_UPSIDEDOWN);
-		} else if (current.rotate == 270) {
-			pixbufrot = gdk_pixbuf_rotate_simple(pixbuf, GDK_PIXBUF_ROTATE_CLOCKWISE);
-		}
-
-		// Draw preview image
-		scale = (double) preview_width / gdk_pixbuf_get_width(pixbufrot);
-		cr = cairo_create(surface);
-		cairo_set_source_rgb(cr, 0, 0, 0);
-		cairo_paint(cr);
-		cairo_scale(cr, scale, scale);
-		gdk_cairo_set_source_pixbuf(cr, pixbufrot, 0, 0);
-		cairo_pattern_set_extend(cairo_get_source(cr), CAIRO_EXTEND_NONE);
-		cairo_paint(cr);
-
-		// Draw controls over preview
-		cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
-		cairo_set_source_surface(cr, status_surface, 0, 0);
-		cairo_paint(cr);
-
-		// Queue gtk3 repaint of the preview area
-		gtk_widget_queue_draw_area(preview, 0, 0, preview_width, preview_height);
-		cairo_destroy(cr);
-		g_object_unref(pixbufrot);
-		g_object_unref(pixbuf);
-	} else {
-		capture--;
-		time(&rawtime);
-		tim = *(localtime(&rawtime));
-		strftime(timestamp, 30, "%Y%m%d%H%M%S", &tim);
-		strftime(datetime, 20, "%Y:%m:%d %H:%M:%S", &tim);
-
-		sprintf(fname_target, "%s/Pictures/IMG%s", getenv("HOME"), timestamp);
-		sprintf(fname, "%s/%d.dng", burst_dir, burst_length - capture);
-
-		// Get latest exposure and gain now the auto gain/exposure is disabled while capturing
-		gain = v4l2_ctrl_get(current.fd, current.gain_ctrl);
-		exposure = v4l2_ctrl_get(current.fd, V4L2_CID_EXPOSURE);
-
-		if(!(tif = TIFFOpen(fname, "w"))) {
-			printf("Could not open tiff\n");
-		}
-
-		// Define TIFF thumbnail
-		TIFFSetField(tif, TIFFTAG_SUBFILETYPE, 1);
-		TIFFSetField(tif, TIFFTAG_IMAGEWIDTH, current.width >> 4);
-		TIFFSetField(tif, TIFFTAG_IMAGELENGTH, current.height >> 4);
-		TIFFSetField(tif, TIFFTAG_BITSPERSAMPLE, 8);
-		TIFFSetField(tif, TIFFTAG_COMPRESSION, COMPRESSION_NONE);
-		TIFFSetField(tif, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_RGB);
-		TIFFSetField(tif, TIFFTAG_MAKE, exif_make);
-		TIFFSetField(tif, TIFFTAG_MODEL, exif_model);
-		TIFFSetField(tif, TIFFTAG_ORIENTATION, ORIENTATION_TOPLEFT);
-		TIFFSetField(tif, TIFFTAG_DATETIME, datetime);
-		TIFFSetField(tif, TIFFTAG_SAMPLESPERPIXEL, 3);
-		TIFFSetField(tif, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
-		TIFFSetField(tif, TIFFTAG_SOFTWARE, "Megapixels");
-		TIFFSetField(tif, TIFFTAG_SUBIFD, 1, &sub_offset);
-		TIFFSetField(tif, TIFFTAG_DNGVERSION, "\001\001\0\0");
-		TIFFSetField(tif, TIFFTAG_DNGBACKWARDVERSION, "\001\0\0\0");
-		sprintf(uniquecameramodel, "%s %s", exif_make, exif_model);
-		TIFFSetField(tif, TIFFTAG_UNIQUECAMERAMODEL, uniquecameramodel);
-		if(current.colormatrix[0]) {
-			TIFFSetField(tif, TIFFTAG_COLORMATRIX1, 9, current.colormatrix);
-		} else {
-			TIFFSetField(tif, TIFFTAG_COLORMATRIX1, 9, colormatrix_srgb);
-		}
-		if(current.forwardmatrix[0]) {
-			TIFFSetField(tif, TIFFTAG_FORWARDMATRIX1, 9, current.forwardmatrix);
-		}
-		TIFFSetField(tif, TIFFTAG_ASSHOTNEUTRAL, 3, neutral);
-		TIFFSetField(tif, TIFFTAG_CALIBRATIONILLUMINANT1, 21);
-		// Write black thumbnail, only windows uses this
-		{
-			unsigned char *buf = (unsigned char *)calloc(1, (int)current.width >> 4);
-			for (int row = 0; row < current.height>>4; row++) {
-				TIFFWriteScanline(tif, buf, row, 0);
-			}
-			free(buf);
-		}
-		TIFFWriteDirectory(tif);
-
-		// Define main photo
-		TIFFSetField(tif, TIFFTAG_SUBFILETYPE, 0);
-		TIFFSetField(tif, TIFFTAG_IMAGEWIDTH, current.width);
-		TIFFSetField(tif, TIFFTAG_IMAGELENGTH, current.height);
-		TIFFSetField(tif, TIFFTAG_BITSPERSAMPLE, 8);
-		TIFFSetField(tif, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_CFA);
-		TIFFSetField(tif, TIFFTAG_SAMPLESPERPIXEL, 1);
-		TIFFSetField(tif, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
-		TIFFSetField(tif, TIFFTAG_CFAREPEATPATTERNDIM, cfapatterndim);
-		TIFFSetField(tif, TIFFTAG_CFAPATTERN, "\002\001\001\000"); // BGGR
-		if(current.whitelevel) {
-			TIFFSetField(tif, TIFFTAG_WHITELEVEL, 1, &current.whitelevel);
-		}
-		if(current.blacklevel) {
-			TIFFSetField(tif, TIFFTAG_BLACKLEVEL, 1, &current.blacklevel);
-		}
-		TIFFCheckpointDirectory(tif);
-		printf("Writing frame to %s\n", fname);
-		
-		unsigned char *pLine = (unsigned char*)malloc(current.width);
-		for(int row = 0; row < current.height; row++){
-			TIFFWriteScanline(tif, ((uint8_t *)p)+(row*current.width), row, 0);
-		}
-		free(pLine);
-		TIFFWriteDirectory(tif);
-
-		// Add an EXIF block to the tiff
-		TIFFCreateEXIFDirectory(tif);
-		// 1 = manual, 2 = full auto, 3 = aperture priority, 4 = shutter priority
-		if (auto_exposure) {
-			TIFFSetField(tif, EXIFTAG_EXPOSUREPROGRAM, 2);
-		} else {
-			TIFFSetField(tif, EXIFTAG_EXPOSUREPROGRAM, 1);
-		}
-
-		TIFFSetField(tif, EXIFTAG_EXPOSURETIME, (1.0/current.rate) / ((float)current.height / (float)exposure));
-		isospeed[0] = (uint16_t)remap(gain - 1, 0, current.gain_max, current.iso_min, current.iso_max);
-		TIFFSetField(tif, EXIFTAG_ISOSPEEDRATINGS, 1, isospeed);
-		TIFFSetField(tif, EXIFTAG_FLASH, 0);
-
-		TIFFSetField(tif, EXIFTAG_DATETIMEORIGINAL, datetime);
-		TIFFSetField(tif, EXIFTAG_DATETIMEDIGITIZED, datetime);
-		if(current.fnumber) {
-			TIFFSetField(tif, EXIFTAG_FNUMBER, current.fnumber);
-		}
-		if(current.focallength) {
-			TIFFSetField(tif, EXIFTAG_FOCALLENGTH, current.focallength);
-		}
-		if(current.focallength && current.cropfactor) {
-			TIFFSetField(tif, EXIFTAG_FOCALLENGTHIN35MMFILM, (short)(current.focallength * current.cropfactor));
-		}
-		TIFFWriteCustomDirectory(tif, &exif_offset);
-		TIFFFreeDirectory(tif);
-
-		// Update exif pointer
-		TIFFSetDirectory(tif, 0);
-		TIFFSetField(tif, TIFFTAG_EXIFIFD, exif_offset);
-		TIFFRewriteDirectory(tif);
-
-		TIFFClose(tif);
-
-
-		if (capture == 0) {
-			// Update the thumbnail if this is the last frame
-			pixbuf = gdk_pixbuf_new(GDK_COLORSPACE_RGB, FALSE, 8, current.width / (skip*2), current.height / (skip*2));
-			pixels = gdk_pixbuf_get_pixels(pixbuf);
-			quick_debayer_bggr8((const uint8_t *)p, pixels, current.width, current.height, skip, current.blacklevel);
-
-			if (current.rotate == 0) {
-				pixbufrot = pixbuf;
-			} else if (current.rotate == 90) {
-				pixbufrot = gdk_pixbuf_rotate_simple(pixbuf, GDK_PIXBUF_ROTATE_COUNTERCLOCKWISE);
-			} else if (current.rotate == 180) {
-				pixbufrot = gdk_pixbuf_rotate_simple(pixbuf, GDK_PIXBUF_ROTATE_UPSIDEDOWN);
-			} else if (current.rotate == 270) {
-				pixbufrot = gdk_pixbuf_rotate_simple(pixbuf, GDK_PIXBUF_ROTATE_CLOCKWISE);
-			}
-			thumb = gdk_pixbuf_scale_simple(pixbufrot, 24, 24, GDK_INTERP_BILINEAR);
-			gtk_image_set_from_pixbuf(GTK_IMAGE(thumb_last), thumb);
-			sprintf(last_path, "%s.jpg", fname_target);
-			if (error != NULL) {
-				g_printerr("%s\n", error->message);
-				g_clear_error(&error);
-			}
-
-			g_object_unref(pixbufrot);
-			g_object_unref(pixbuf);
-
-			// Start post-processing the captured burst
-			g_print("Post process %s to %s.ext\n", burst_dir, fname_target);
-			sprintf(command, "%s %s %s &", processing_script, burst_dir, fname_target);
-			system(command);
-
-			// Restore the auto exposure and gain if needed
-			if (auto_exposure) {
-				v4l2_ctrl_set(current.fd, V4L2_CID_EXPOSURE_AUTO, V4L2_EXPOSURE_AUTO);
-			}
-			if (auto_gain) {
-				v4l2_ctrl_set(current.fd, V4L2_CID_AUTOGAIN, 1);
-			}
-
-		}
-	}
 }
 
 static gboolean
@@ -839,74 +334,6 @@ preview_configure(GtkWidget *widget, GdkEventConfigure *event)
 	return TRUE;
 }
 
-static int
-read_frame(int fd)
-{
-	struct v4l2_buffer buf = {0};
-
-	buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	buf.memory = V4L2_MEMORY_MMAP;
-	if (xioctl(fd, VIDIOC_DQBUF, &buf) == -1) {
-		switch (errno) {
-			case EAGAIN:
-				return 0;
-			case EIO:
-				/* Could ignore EIO, see spec. */
-				/* fallthrough */
-			default:
-				errno_exit("VIDIOC_DQBUF");
-				break;
-		}
-	}
-
-	//assert(buf.index < n_buffers);
-
-	process_image(buffers[buf.index].start, buf.bytesused);
-
-	if (xioctl(fd, VIDIOC_QBUF, &buf) == -1) {
-		errno_exit("VIDIOC_QBUF");
-	}
-
-	return 1;
-}
-
-gboolean
-get_frame()
-{
-	if (ready == 0)
-		return TRUE;
-	while (1) {
-		fd_set fds;
-		struct timeval tv;
-		int r;
-
-		FD_ZERO(&fds);
-		FD_SET(video_fd, &fds);
-
-		/* Timeout. */
-		tv.tv_sec = 2;
-		tv.tv_usec = 0;
-
-		r = select(video_fd + 1, &fds, NULL, NULL, &tv);
-
-		if (r == -1) {
-			if (EINTR == errno) {
-				continue;
-			}
-			errno_exit("select");
-		} else if (r == 0) {
-			fprintf(stderr, "select timeout\\n");
-			exit(EXIT_FAILURE);
-		}
-
-		if (read_frame(video_fd)) {
-			break;
-		}
-		/* EAGAIN - continue select loop. */
-	}
-	return TRUE;
-}
-
 int
 strtoint(const char *nptr, char **endptr, int base)
 {
@@ -927,24 +354,17 @@ config_ini_handler(void *user, const char *section, const char *name,
 			cc = &front_cam;
 		}
 		if (strcmp(name, "width") == 0) {
-			cc->width = strtoint(value, NULL, 10);
+			cc->camera_mode.width = strtoint(value, NULL, 10);
 		} else if (strcmp(name, "height") == 0) {
-			cc->height = strtoint(value, NULL, 10);
+			cc->camera_mode.height = strtoint(value, NULL, 10);
 		} else if (strcmp(name, "rate") == 0) {
-			cc->rate = strtoint(value, NULL, 10);
+			cc->camera_mode.frame_interval.numerator = 1;
+			cc->camera_mode.frame_interval.denominator = strtoint(value, NULL, 10);
 		} else if (strcmp(name, "rotate") == 0) {
 			cc->rotate = strtoint(value, NULL, 10);
 		} else if (strcmp(name, "fmt") == 0) {
-			if (strcmp(value, "RGGB8") == 0) {
-				cc->fmt = V4L2_PIX_FMT_SRGGB8;
-			} else if (strcmp(value, "BGGR8") == 0) {
-				cc->fmt = V4L2_PIX_FMT_SBGGR8;
-				cc->mbus = MEDIA_BUS_FMT_SBGGR8_1X8;
-			} else if (strcmp(value, "GRBG8") == 0) {
-				cc->fmt = V4L2_PIX_FMT_SGRBG8;
-			} else if (strcmp(value, "GBRG8") == 0) {
-				cc->fmt = V4L2_PIX_FMT_SGBRG8;
-			} else {
+			cc->camera_mode.pixel_format = mp_pixel_format_from_str(value);
+			if (cc->camera_mode.pixel_format == MP_PIXEL_FMT_UNSUPPORTED) {
 				g_printerr("Unsupported pixelformat %s\n", value);
 				exit(1);
 			}
@@ -1010,158 +430,457 @@ config_ini_handler(void *user, const char *section, const char *name,
 	return 1;
 }
 
-int
-find_dev_node(int maj, int min, char *fnbuf)
+static MPDevice *device = NULL;
+static MPPipeline *capture_pipeline = NULL;
+static MPPipelineCapture *pipeline_capture = NULL;
+static MPPipeline *process_pipeline = NULL;
+
+struct update_preview_args {
+	GdkPixbuf *pixbuf;
+	bool update_thumbnail;
+};
+
+static bool update_preview(struct update_preview_args *args)
 {
-	DIR *d;
-	struct dirent *dir;
-	struct stat info;
-	d = opendir("/dev");
-	while ((dir = readdir(d)) != NULL) {
-		sprintf(fnbuf, "/dev/%s", dir->d_name);
-		stat(fnbuf, &info);
-		if (!S_ISCHR(info.st_mode)) {
-			continue;
-		}
-		if (major(info.st_rdev) == maj && minor(info.st_rdev) == min) {
-			return 0;
-		}
+	if (!surface)
+		return false;
+
+	if (args->update_thumbnail)
+	{
+		GdkPixbuf *thumb = gdk_pixbuf_scale_simple(args->pixbuf, 24, 24, GDK_INTERP_BILINEAR);
+		gtk_image_set_from_pixbuf(GTK_IMAGE(thumb_last), thumb);
 	}
-	return -1;
+
+	// Draw preview image
+	double scale = (double) preview_width / gdk_pixbuf_get_width(args->pixbuf);
+	cairo_t *cr = cairo_create(surface);
+	cairo_set_source_rgb(cr, 0, 0, 0);
+	cairo_paint(cr);
+	cairo_scale(cr, scale, scale);
+	gdk_cairo_set_source_pixbuf(cr, args->pixbuf, 0, 0);
+	cairo_pattern_set_extend(cairo_get_source(cr), CAIRO_EXTEND_NONE);
+	cairo_paint(cr);
+
+	// Draw controls over preview
+	cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+	cairo_set_source_surface(cr, status_surface, 0, 0);
+	cairo_paint(cr);
+
+	cairo_destroy(cr);
+
+	// Queue gtk3 repaint of the preview area
+	gtk_widget_queue_draw_area(preview, 0, 0, preview_width, preview_height);
+
+	g_object_unref(args->pixbuf);
+
+	return false;
 }
 
-int
-setup_rear()
+static void process_image_for_preview(const MPImage *image, bool update_thumbnail)
 {
-	struct media_link_desc link = {0};
+	int skip = 0;
+	if (current_cam->rotate == 0 || current_cam->rotate == 180) {
+		skip = round((image->width / 2) / (float)preview_width);
+	} else {
+		skip = round((image->width / 2) / (float)preview_height);
+	}
+	skip += 1;
 
-	// Disable the interface<->front link
-	link.flags = 0;
-	link.source.entity = front_cam.entity_id;
-	link.source.index = 0;
-	link.sink.entity = interface_entity_id;
-	link.sink.index = 0;
-
-	if (xioctl(media_fd, MEDIA_IOC_SETUP_LINK, &link) < 0) {
-		g_printerr("Could not disable front camera link\n");
-		return -1;
+	if (skip < 0) {
+		skip = 0;
+	} else if (skip > 3) {
+		skip = 3;
 	}
 
-	// Enable the interface<->rear link
-	link.flags = MEDIA_LNK_FL_ENABLED;
-	link.source.entity = rear_cam.entity_id;
-	link.source.index = 0;
-	link.sink.entity = interface_entity_id;
-	link.sink.index = 0;
+	GdkPixbuf *pixbuf = gdk_pixbuf_new(
+		GDK_COLORSPACE_RGB,
+		FALSE,
+		8,
+		image->width / (skip*2),
+		image->height / (skip*2));
 
-	if (xioctl(media_fd, MEDIA_IOC_SETUP_LINK, &link) < 0) {
-		g_printerr("Could not enable rear camera link\n");
-		return -1;
+	guchar *pixels = gdk_pixbuf_get_pixels(pixbuf);
+	quick_debayer_bggr8(
+		(const uint8_t *)image->data,
+		pixels,
+		image->width,
+		image->height,
+		skip,
+		current_cam->blacklevel);
+
+	GdkPixbuf *pixbufrot;
+	if (current_cam->rotate == 0) {
+		pixbufrot = pixbuf;
+	} else if (current_cam->rotate == 90) {
+		pixbufrot = gdk_pixbuf_rotate_simple(pixbuf, GDK_PIXBUF_ROTATE_COUNTERCLOCKWISE);
+	} else if (current_cam->rotate == 180) {
+		pixbufrot = gdk_pixbuf_rotate_simple(pixbuf, GDK_PIXBUF_ROTATE_UPSIDEDOWN);
+	} else if (current_cam->rotate == 270) {
+		pixbufrot = gdk_pixbuf_rotate_simple(pixbuf, GDK_PIXBUF_ROTATE_CLOCKWISE);
 	}
 
-	current = rear_cam;
+	if (pixbuf != pixbufrot) {
+		g_object_unref(pixbuf);
+	}
 
-	// Find camera node
-	init_sensor(current.dev, current.width, current.height, current.mbus, current.rate);
-	return 0;
+	struct update_preview_args *args = malloc(sizeof(struct update_preview_args));
+	args->pixbuf = pixbufrot;
+	args->update_thumbnail = update_thumbnail;
+
+	g_main_context_invoke_full(
+		g_main_context_default(),
+		G_PRIORITY_DEFAULT,
+		(GSourceFunc)update_preview,
+		args,
+		free);
 }
 
-int
-setup_front()
+static void process_image_for_capture(const MPImage *image, uint8_t count)
 {
-	struct media_link_desc link = {0};
+	static const float neutral[] = {1.0, 1.0, 1.0};
+	static const short cfapatterndim[] = {2, 2};
+	static uint16_t isospeed[] = {0};
 
-	// Disable the interface<->rear link
-	link.flags = 0;
-	link.source.entity = rear_cam.entity_id;
-	link.source.index = 0;
-	link.sink.entity = interface_entity_id;
-	link.sink.index = 0;
+	time_t rawtime;
+	time(&rawtime);
+	struct tm tim = *(localtime(&rawtime));
 
-	if (xioctl(media_fd, MEDIA_IOC_SETUP_LINK, &link) < 0) {
-		g_printerr("Could not disable rear camera link\n");
-		return -1;
+	char datetime[20] = {0};
+	strftime(datetime, 20, "%Y:%m:%d %H:%M:%S", &tim);
+
+	char fname[255];
+	sprintf(fname, "%s/%d.dng", burst_dir, count);
+
+	// Get latest exposure and gain now the auto gain/exposure is disabled while capturing
+	gain = v4l2_ctrl_get(current_cam->fd, current_cam->gain_ctrl);
+	exposure = v4l2_ctrl_get(current_cam->fd, V4L2_CID_EXPOSURE);
+
+	TIFF *tif = TIFFOpen(fname, "w");
+	if(!tif) {
+		printf("Could not open tiff\n");
 	}
 
-	// Enable the interface<->rear link
-	link.flags = MEDIA_LNK_FL_ENABLED;
-	link.source.entity = front_cam.entity_id;
-	link.source.index = 0;
-	link.sink.entity = interface_entity_id;
-	link.sink.index = 0;
-
-	if (xioctl(media_fd, MEDIA_IOC_SETUP_LINK, &link) < 0) {
-		g_printerr("Could not enable front camera link\n");
-		return -1;
+	// Define TIFF thumbnail
+	TIFFSetField(tif, TIFFTAG_SUBFILETYPE, 1);
+	TIFFSetField(tif, TIFFTAG_IMAGEWIDTH, image->width >> 4);
+	TIFFSetField(tif, TIFFTAG_IMAGELENGTH, image->height >> 4);
+	TIFFSetField(tif, TIFFTAG_BITSPERSAMPLE, 8);
+	TIFFSetField(tif, TIFFTAG_COMPRESSION, COMPRESSION_NONE);
+	TIFFSetField(tif, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_RGB);
+	TIFFSetField(tif, TIFFTAG_MAKE, exif_make);
+	TIFFSetField(tif, TIFFTAG_MODEL, exif_model);
+	TIFFSetField(tif, TIFFTAG_ORIENTATION, ORIENTATION_TOPLEFT);
+	TIFFSetField(tif, TIFFTAG_DATETIME, datetime);
+	TIFFSetField(tif, TIFFTAG_SAMPLESPERPIXEL, 3);
+	TIFFSetField(tif, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
+	TIFFSetField(tif, TIFFTAG_SOFTWARE, "Megapixels");
+	long sub_offset = 0;
+	TIFFSetField(tif, TIFFTAG_SUBIFD, 1, &sub_offset);
+	TIFFSetField(tif, TIFFTAG_DNGVERSION, "\001\001\0\0");
+	TIFFSetField(tif, TIFFTAG_DNGBACKWARDVERSION, "\001\0\0\0");
+	char uniquecameramodel[255];
+	sprintf(uniquecameramodel, "%s %s", exif_make, exif_model);
+	TIFFSetField(tif, TIFFTAG_UNIQUECAMERAMODEL, uniquecameramodel);
+	if(current_cam->colormatrix[0]) {
+		TIFFSetField(tif, TIFFTAG_COLORMATRIX1, 9, current_cam->colormatrix);
+	} else {
+		TIFFSetField(tif, TIFFTAG_COLORMATRIX1, 9, colormatrix_srgb);
 	}
-	current = front_cam;
-	// Find camera node
-	init_sensor(current.dev, current.width, current.height, current.mbus, current.rate);
-	return 0;
+	if(current_cam->forwardmatrix[0]) {
+		TIFFSetField(tif, TIFFTAG_FORWARDMATRIX1, 9, current_cam->forwardmatrix);
+	}
+	TIFFSetField(tif, TIFFTAG_ASSHOTNEUTRAL, 3, neutral);
+	TIFFSetField(tif, TIFFTAG_CALIBRATIONILLUMINANT1, 21);
+	// Write black thumbnail, only windows uses this
+	{
+		unsigned char *buf = (unsigned char *)calloc(1, (int)image->width >> 4);
+		for (int row = 0; row < image->height>>4; row++) {
+			TIFFWriteScanline(tif, buf, row, 0);
+		}
+		free(buf);
+	}
+	TIFFWriteDirectory(tif);
+
+	// Define main photo
+	TIFFSetField(tif, TIFFTAG_SUBFILETYPE, 0);
+	TIFFSetField(tif, TIFFTAG_IMAGEWIDTH, image->width);
+	TIFFSetField(tif, TIFFTAG_IMAGELENGTH, image->height);
+	TIFFSetField(tif, TIFFTAG_BITSPERSAMPLE, 8);
+	TIFFSetField(tif, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_CFA);
+	TIFFSetField(tif, TIFFTAG_SAMPLESPERPIXEL, 1);
+	TIFFSetField(tif, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
+	TIFFSetField(tif, TIFFTAG_CFAREPEATPATTERNDIM, cfapatterndim);
+	TIFFSetField(tif, TIFFTAG_CFAPATTERN, "\002\001\001\000"); // BGGR
+	if(current_cam->whitelevel) {
+		TIFFSetField(tif, TIFFTAG_WHITELEVEL, 1, &current_cam->whitelevel);
+	}
+	if(current_cam->blacklevel) {
+		TIFFSetField(tif, TIFFTAG_BLACKLEVEL, 1, &current_cam->blacklevel);
+	}
+	TIFFCheckpointDirectory(tif);
+	printf("Writing frame to %s\n", fname);
+
+	unsigned char *pLine = (unsigned char*)malloc(image->width);
+	for(int row = 0; row < image->height; row++){
+		TIFFWriteScanline(tif, image->data + row * image->width, row, 0);
+	}
+	free(pLine);
+	TIFFWriteDirectory(tif);
+
+	// Add an EXIF block to the tiff
+	TIFFCreateEXIFDirectory(tif);
+	// 1 = manual, 2 = full auto, 3 = aperture priority, 4 = shutter priority
+	if (auto_exposure) {
+		TIFFSetField(tif, EXIFTAG_EXPOSUREPROGRAM, 2);
+	} else {
+		TIFFSetField(tif, EXIFTAG_EXPOSUREPROGRAM, 1);
+	}
+
+	float interval = current_cam->camera_mode.frame_interval.numerator / (float) current_cam->camera_mode.frame_interval.denominator;
+	TIFFSetField(tif, EXIFTAG_EXPOSURETIME, interval / ((float)image->height / (float)exposure));
+	isospeed[0] = (uint16_t)remap(gain - 1, 0, current_cam->gain_max, current_cam->iso_min, current_cam->iso_max);
+	TIFFSetField(tif, EXIFTAG_ISOSPEEDRATINGS, 1, isospeed);
+	TIFFSetField(tif, EXIFTAG_FLASH, 0);
+
+	TIFFSetField(tif, EXIFTAG_DATETIMEORIGINAL, datetime);
+	TIFFSetField(tif, EXIFTAG_DATETIMEDIGITIZED, datetime);
+	if(current_cam->fnumber) {
+		TIFFSetField(tif, EXIFTAG_FNUMBER, current_cam->fnumber);
+	}
+	if(current_cam->focallength) {
+		TIFFSetField(tif, EXIFTAG_FOCALLENGTH, current_cam->focallength);
+	}
+	if(current_cam->focallength && current_cam->cropfactor) {
+		TIFFSetField(tif, EXIFTAG_FOCALLENGTHIN35MMFILM, (short)(current_cam->focallength * current_cam->cropfactor));
+	}
+	uint64_t exif_offset = 0;
+	TIFFWriteCustomDirectory(tif, &exif_offset);
+	TIFFFreeDirectory(tif);
+
+	// Update exif pointer
+	TIFFSetDirectory(tif, 0);
+	TIFFSetField(tif, TIFFTAG_EXIFIFD, exif_offset);
+	TIFFRewriteDirectory(tif);
+
+	TIFFClose(tif);
 }
 
-int
-find_cameras()
+static void process_capture_burst()
 {
-	struct media_entity_desc entity = {0};
-	int ret;
-	int found = 0;
+	time_t rawtime;
+	time(&rawtime);
+	struct tm tim = *(localtime(&rawtime));
 
-	while (1) {
-		entity.id = entity.id | MEDIA_ENT_ID_FLAG_NEXT;
-		ret = xioctl(media_fd, MEDIA_IOC_ENUM_ENTITIES, &entity);
-		if (ret < 0) {
-			break;
-		}
-		if (strncmp(entity.name, front_cam.dev_name, strlen(front_cam.dev_name)) == 0) {
-			front_cam.entity_id = entity.id;
-			find_dev_node(entity.dev.major, entity.dev.minor, front_cam.dev);
-			printf("Found front cam, is %s at %s\n", entity.name, front_cam.dev);
-			found++;
-		}
-		if (strncmp(entity.name, rear_cam.dev_name, strlen(rear_cam.dev_name)) == 0) {
-			rear_cam.entity_id = entity.id;
-			find_dev_node(entity.dev.major, entity.dev.minor, rear_cam.dev);
-			printf("Found rear cam, is %s at %s\n", entity.name, rear_cam.dev);
-			found++;
-		}
-		if (entity.type == MEDIA_ENT_F_IO_V4L) {
-			interface_entity_id = entity.id;
-			find_dev_node(entity.dev.major, entity.dev.minor, dev_name);
-			printf("Found v4l2 interface node at %s\n", dev_name);
-		}
+	char timestamp[30];
+	strftime(timestamp, 30, "%Y%m%d%H%M%S", &tim);
+
+	char fname_target[255];
+	sprintf(fname_target, "%s/Pictures/IMG%s", getenv("HOME"), timestamp);
+
+	// Start post-processing the captured burst
+	char command[1024];
+	g_print("Post process %s to %s.ext\n", burst_dir, fname_target);
+	sprintf(command, "%s %s %s &", processing_script, burst_dir, fname_target);
+	system(command);
+
+	// Restore the auto exposure and gain if needed
+	if (auto_exposure) {
+		v4l2_ctrl_set(current_cam->fd, V4L2_CID_EXPOSURE_AUTO, V4L2_EXPOSURE_AUTO);
 	}
-	if (found < 2) {
-		return -1;
+	if (auto_gain) {
+		v4l2_ctrl_set(current_cam->fd, V4L2_CID_AUTOGAIN, 1);
 	}
-	return 0;
 }
 
+static volatile size_t pipeline_frames_received = 0;
+static volatile size_t pipeline_frames_processed = 0;
+static volatile uint8_t pipeline_capture_frames = 0;
+static volatile uint8_t pipeline_capture_burst_size = 0;
 
-int
-find_media_fd()
+static void pipeline_process_image(MPPipeline *pipeline, MPImage *image)
 {
-	DIR *d;
-	struct dirent *dir;
-	int fd;
-	char fnbuf[261];
-	struct media_device_info mdi = {0};
-	d = opendir("/dev");
-	while ((dir = readdir(d)) != NULL) {
-		if (strncmp(dir->d_name, "media", 5) == 0) {
-			sprintf(fnbuf, "/dev/%s", dir->d_name);
-			fd = open(fnbuf, O_RDWR);
-			xioctl(fd, MEDIA_IOC_DEVICE_INFO, &mdi);
-			if (strcmp(mdi.driver, media_drv_name) == 0) {
-				printf("Found media device: %s (%s)\n", fnbuf, mdi.driver);
-				media_fd = fd;
-				return 0;
-			}
-			close(fd);
+	bool update_thumbnail = false;
+
+	if (pipeline_capture_frames > 0) {
+		uint8_t count = pipeline_capture_burst_size - pipeline_capture_frames;
+		--pipeline_capture_frames;
+
+		process_image_for_capture(image, count);
+
+		if (pipeline_capture_frames == 0) {
+			process_capture_burst();
+			update_thumbnail = true;
 		}
 	}
-	g_printerr("Could not find /dev/media* node matching '%s'\n", media_drv_name);
-	return 1;
+
+	process_image_for_preview(image, update_thumbnail);
+
+	free(image->data);
+
+	++pipeline_frames_processed;
+}
+
+static void pipeline_on_frame_received(MPImage image, void *data)
+{
+	// If we haven't processed the previous frame yet, drop this one
+	if (pipeline_frames_processed != pipeline_frames_received
+		&& pipeline_capture_frames == 0)
+	{
+		printf("Dropped frame\n");
+		return;
+	}
+
+	// TODO: If the last image hasn't been processed yet we should drop this one
+
+	// Copy from the camera buffer
+	size_t size = mp_pixel_format_bytes_per_pixel(image.pixel_format) * image.width * image.height;
+	uint8_t *buffer = malloc(size);
+	memcpy(buffer, image.data, size);
+
+	image.data = buffer;
+
+	++pipeline_frames_received;
+
+	mp_pipeline_invoke(process_pipeline, (MPPipelineCallback)pipeline_process_image, &image, sizeof(MPImage));
+}
+
+static void pipeline_swap_camera(MPPipeline *p, struct camerainfo **_info)
+{
+	struct camerainfo *info = *_info;
+
+	if (pipeline_capture) {
+		mp_pipeline_capture_end(pipeline_capture);
+	}
+
+	struct camerainfo *other = info == &front_cam ? &rear_cam : &front_cam;
+
+	mp_device_setup_link(device, other->pad_id, interface_pad_id, false);
+	mp_device_setup_link(device, info->pad_id, interface_pad_id, true);
+
+	mp_camera_set_mode(info->camera, &info->camera_mode);
+	pipeline_capture = mp_pipeline_capture_start(capture_pipeline, info->camera, pipeline_on_frame_received, NULL);
+
+	current_cam = info;
+}
+
+static void pipeline_setup_camera(struct camerainfo *info)
+{
+	const struct media_v2_entity *entity = mp_device_find_entity(device, info->dev_name);
+	if (!entity) {
+		g_printerr("Count not find camera entity matching '%s'\n", info->dev_name);
+		exit(EXIT_FAILURE);
+	}
+
+	const struct media_v2_pad *pad = mp_device_get_pad_from_entity(device, entity->id);
+
+	info->pad_id = pad->id;
+
+	const struct media_v2_interface *interface = mp_device_find_entity_interface(device, entity->id);
+
+	if (!mp_find_device_path(interface->devnode, info->dev_name, 260)) {
+		g_printerr("Count not find camera device path\n");
+		exit(EXIT_FAILURE);
+	}
+
+	info->fd = open(info->dev_name, O_RDWR);
+	if (info->fd == -1) {
+		g_printerr("Could not open %s\n", info->dev_name);
+		exit(EXIT_FAILURE);
+	}
+
+	info->camera = mp_camera_new(video_fd, info->fd);
+
+	// Trigger continuous auto focus if the sensor supports it
+	if (v4l2_has_control(info->fd, V4L2_CID_FOCUS_AUTO)) {
+		info->has_af_c = 1;
+		v4l2_ctrl_set(info->fd, V4L2_CID_FOCUS_AUTO, 1);
+	}
+	if (v4l2_has_control(info->fd, V4L2_CID_AUTO_FOCUS_START)) {
+		info->has_af_s = 1;
+	}
+
+	if (v4l2_has_control(info->fd, V4L2_CID_GAIN)) {
+		info->gain_ctrl = V4L2_CID_GAIN;
+		info->gain_max = v4l2_ctrl_get_max(info->fd, V4L2_CID_GAIN);
+	}
+
+	if (v4l2_has_control(info->fd, V4L2_CID_ANALOGUE_GAIN)) {
+		info->gain_ctrl = V4L2_CID_ANALOGUE_GAIN;
+		info->gain_max = v4l2_ctrl_get_max(info->fd, V4L2_CID_ANALOGUE_GAIN);
+	}
+}
+
+static void pipeline_setup(MPPipeline *pipeline, void *data)
+{
+	device = mp_device_find(media_drv_name);
+	if (!device) {
+		g_printerr("Could not find /dev/media* node matching '%s'\n", media_drv_name);
+		exit(EXIT_FAILURE);
+	}
+
+	const struct media_v2_entity *entity = mp_device_find_entity(device, media_drv_name);
+	if (!entity) {
+		g_printerr("Count not find device video entity\n");
+		exit(EXIT_FAILURE);
+	}
+
+	const struct media_v2_pad *pad = mp_device_get_pad_from_entity(device, entity->id);
+	interface_pad_id = pad->id;
+
+	const struct media_v2_interface *interface = mp_device_find_entity_interface(device, entity->id);
+	if (!mp_find_device_path(interface->devnode, dev_name, 260)) {
+		g_printerr("Count not find video path\n");
+		exit(EXIT_FAILURE);
+	}
+
+	video_fd = open(dev_name, O_RDWR);
+	if (video_fd == -1) {
+		g_printerr("Could not open %s\n", dev_name);
+		exit(EXIT_FAILURE);
+	}
+
+	pipeline_setup_camera(&front_cam);
+	pipeline_setup_camera(&rear_cam);
+
+	struct camerainfo *next = &rear_cam;
+	pipeline_swap_camera(pipeline, &next);
+}
+
+void start_pipeline()
+{
+	capture_pipeline = mp_pipeline_new();
+	process_pipeline = mp_pipeline_new();
+
+	mp_pipeline_invoke(capture_pipeline, pipeline_setup, NULL, 0);
+
+	auto_exposure = 1;
+	auto_gain = 1;
+	draw_controls();
+}
+
+void stop_pipeline()
+{
+	if (pipeline_capture) {
+		mp_pipeline_capture_end(pipeline_capture);
+	}
+
+	mp_pipeline_free(capture_pipeline);
+	mp_pipeline_free(process_pipeline);
+}
+
+static void pipeline_start_capture_impl(MPPipeline *pipeline, uint32_t *count)
+{
+	pipeline_capture_frames = *count;
+	pipeline_capture_burst_size = *count;
+
+	// Disable the autogain/exposure while taking the burst
+	v4l2_ctrl_set(current_cam->fd, V4L2_CID_AUTOGAIN, 0);
+	v4l2_ctrl_set(current_cam->fd, V4L2_CID_EXPOSURE_AUTO, V4L2_EXPOSURE_MANUAL);
+}
+
+void pipeline_start_capture(uint32_t count)
+{
+	mp_pipeline_invoke(process_pipeline, (MPPipelineCallback)pipeline_start_capture_impl, &count, sizeof(uint32_t));
 }
 
 void
@@ -1203,12 +922,8 @@ on_shutter_clicked(GtkWidget *widget, gpointer user_data)
 	}
 
 	strcpy(burst_dir, tempdir);
-	
-	// Disable the autogain/exposure while taking the burst
-	v4l2_ctrl_set(current.fd, V4L2_CID_AUTOGAIN, 0);
-	v4l2_ctrl_set(current.fd, V4L2_CID_EXPOSURE_AUTO, V4L2_EXPOSURE_MANUAL);
 
-	capture = burst_length;
+	pipeline_start_capture(burst_length);
 }
 
 void
@@ -1232,7 +947,7 @@ on_preview_tap(GtkWidget *widget, GdkEventButton *event, gpointer user_data)
 			gtk_label_set_text(GTK_LABEL(control_name), "ISO");
 			gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(control_auto), auto_gain);
 			gtk_adjustment_set_lower(control_slider, 0.0);
-			gtk_adjustment_set_upper(control_slider, (float)current.gain_max);
+			gtk_adjustment_set_upper(control_slider, (float)current_cam->gain_max);
 			gtk_adjustment_set_value(control_slider, (double)gain);
 
 		} else if (event->x > 60 && event->x < 120) {
@@ -1249,9 +964,9 @@ on_preview_tap(GtkWidget *widget, GdkEventButton *event, gpointer user_data)
 	}
 
 	// Tapped preview image itself, try focussing
-	if (current.has_af_s) {
-		v4l2_ctrl_set(current.fd, V4L2_CID_AUTO_FOCUS_STOP, 1);
-		v4l2_ctrl_set(current.fd, V4L2_CID_AUTO_FOCUS_START, 1);
+	if (current_cam->has_af_s) {
+		v4l2_ctrl_set(current_cam->fd, V4L2_CID_AUTO_FOCUS_STOP, 1);
+		v4l2_ctrl_set(current_cam->fd, V4L2_CID_AUTO_FOCUS_START, 1);
 	}
 }
 
@@ -1264,23 +979,18 @@ on_error_close_clicked(GtkWidget *widget, gpointer user_data)
 void
 on_camera_switch_clicked(GtkWidget *widget, gpointer user_data)
 {
-	stop_capturing(video_fd);
-	close(current.fd);
-	if (current_is_rear == 1) {
-		setup_front();
-		current_is_rear = 0;
+	struct camerainfo *next;
+	if (current_cam == &rear_cam) {
+		next = &front_cam;
 	} else {
-		setup_rear();
-		current_is_rear = 1;
+		next = &rear_cam;
 	}
-	close(video_fd);
-	video_fd = open(dev_name, O_RDWR);
-	if (video_fd == -1) {
-		g_printerr("Error opening video device: %s\n", dev_name);
-		return;
-	}
-	init_device(video_fd);
-	start_capturing(video_fd);
+
+	mp_pipeline_invoke(capture_pipeline, (MPPipelineCallback)pipeline_swap_camera, &next, sizeof(struct camerainfo *));
+
+	auto_exposure = 1;
+	auto_gain = 1;
+	draw_controls();
 }
 
 void
@@ -1298,7 +1008,7 @@ on_back_clicked(GtkWidget *widget, gpointer user_data)
 void
 on_control_auto_toggled(GtkToggleButton *widget, gpointer user_data)
 {
-	int fd = current.fd;
+	int fd = current_cam->fd;
 	switch (current_control) {
 		case USER_CONTROL_ISO:
 			auto_gain = gtk_toggle_button_get_active(widget);
@@ -1332,12 +1042,12 @@ on_control_slider_changed(GtkAdjustment *widget, gpointer user_data)
 	switch (current_control) {
 		case USER_CONTROL_ISO:
 			gain = (int)value;
-			v4l2_ctrl_set(current.fd, current.gain_ctrl, gain);
+			v4l2_ctrl_set(current_cam->fd, current_cam->gain_ctrl, gain);
 			break;
 		case USER_CONTROL_SHUTTER:
 			// So far all sensors use exposure time in number of sensor rows
-			exposure = (int)(value / 360.0 * current.height);
-			v4l2_ctrl_set(current.fd, V4L2_CID_EXPOSURE, exposure);
+			exposure = (int)(value / 360.0 * current_cam->camera_mode.height);
+			v4l2_ctrl_set(current_cam->fd, V4L2_CID_EXPOSURE, exposure);
 			break;
 	}
 	draw_controls();
@@ -1537,36 +1247,12 @@ main(int argc, char *argv[])
 		g_printerr("Could not parse config file\n");
 		return 1;
 	}
-	if (find_media_fd() == -1) {
-		g_printerr("Could not find the media node\n");
-		show_error("Could not find the media node");
-		goto failed;
-	}
-	if (find_cameras() == -1) {
-		g_printerr("Could not find the cameras\n");
-		show_error("Could not find the cameras");
-		goto failed;
-	}
-	setup_rear();
+	start_pipeline();
 
-	int fd = open(dev_name, O_RDWR);
-	if (fd == -1) {
-		g_printerr("Error opening video device: %s\n", dev_name);
-		show_error("Error opening the video device");
-		goto failed;
-	}
-
-	video_fd = fd;
-
-	if(init_device(fd) < 0){
-		goto failed;
-	}
-	start_capturing(fd);
-
-failed:
-	printf("window show\n");
 	gtk_widget_show(window);
-	g_idle_add((GSourceFunc)get_frame, NULL);
 	gtk_main();
+
+	stop_pipeline();
+
 	return 0;
 }
